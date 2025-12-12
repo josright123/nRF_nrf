@@ -15,6 +15,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <zephyr/random/random.h>
 #include <string.h>
 #include <errno.h>
 #include <zephyr/drivers/gpio.h>
@@ -22,11 +23,61 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #include <zephyr/net/net_pkt.h>
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/ethernet.h>
+#include <zephyr/toolchain.h>
 #include <ethernet/eth_stats.h>
 
 #include "eth_dm9051_priv.h"
 
+static uint8_t dm9051_read_reg(const struct device *dev, uint8_t reg);
 static void dm9051_read_mem(const struct device *dev, uint8_t *buf, uint16_t len);
+
+extern int endc;
+
+static bool dm9051_mac_is_valid(const uint8_t mac[6])
+{
+ bool all_zero = true;
+
+ for (int i = 0; i < 6; i++) {
+  if (mac[i] != 0x00) {
+   all_zero = false;
+   break;
+  }
+ }
+
+ if (all_zero) {
+  return false;
+ }
+
+ /* Reject multicast/broadcast */
+ if ((mac[0] & 0x01) != 0) {
+  return false;
+ }
+
+ return true;
+}
+
+static void dm9051_generate_random_mac(uint8_t mac[6])
+{
+	uint32_t r = sys_rand32_get();
+
+	/* OUI: Davicom vendor prefix */
+	mac[0] = 0x00;
+	mac[1] = 0x60;
+	mac[2] = 0x6e;
+
+	/* NIC: random bytes */
+	mac[3] = (uint8_t)(r >> 16);
+	mac[4] = (uint8_t)(r >> 8);
+	mac[5] = (uint8_t)(r & 0xFF);
+}
+
+int dm9051_load_mac_from_current_fit(const struct device *dev, uint8_t mac[6])
+{
+ for (int i = 0; i < 6; i++) {
+  mac[i] = dm9051_read_reg(dev, DM9051_PAR + i);
+ }
+ return 0;
+}
 
 int dm9051_read_mem_cb(void *ctx, uint8_t *buf, int len)
 {
@@ -43,17 +94,11 @@ int dm9051_read_mem_cb(void *ctx, uint8_t *buf, int len)
  */
 typedef int (*net_pkt_read_from_cb_t)(void *ctx, uint8_t *buf, int len);
 
-static inline int local_net_pkt_write_from(struct net_pkt *pkt, net_pkt_read_from_cb_t cb,
+static inline int local_net_pkt_read_from(struct net_pkt *pkt, net_pkt_read_from_cb_t cb,
 					   void *ctx, size_t len)
 {
 	size_t remaining = len;
-	struct net_buf *frag;
-
-	if (!pkt->buffer) {
-		return -ENOMEM;
-	}
-
-	frag = pkt->buffer;
+	struct net_buf *frag = pkt->buffer;
 
 	while (frag && remaining > 0) {
 		size_t copy_len = MIN(remaining, net_buf_tailroom(frag));
@@ -305,7 +350,7 @@ static void dm9051_core_reset(const struct device *dev)
 	}
 
 	/* Software defaults */
-	dm9051_write_reg(dev, DM9051_MBNDRY, MBNDRY_BYTE);
+	dm9051_write_reg(dev, DM9051_MBNDRY, MBNDRY_DEFAULT);
 	dm9051_write_reg(dev, DM9051_PPCR, PPCR_PAUSE_COUNT);
 	dm9051_write_reg(dev, DM9051_LMCR, LMCR_MODE1);
 	dm9051_write_reg(dev, DM9051_INTR, INTR_ACTIVE_LOW);
@@ -428,13 +473,26 @@ static int eth_dm9051_tx(const struct device *dev, struct net_pkt *pkt)
 
 	k_sem_take(&context->tx_rx_sem, K_FOREVER);
 
+	/* tx pad default_boundary */
+	//uint16_t pad_len = (MBNDRY_DEFAULT == MBNDRY_WORD) && (len & 1) ? len + 1 : len;
+
 	/* Set packet length */
 	dm9051_write_reg(dev, DM9051_TXPLL, len & 0xff);
 	dm9051_write_reg(dev, DM9051_TXPLH, (len >> 8) & 0xff);
 
 	/* Write packet data */
+	//uint16_t pad = 0;
 	for (frag = pkt->frags; frag; frag = frag->frags) {
-		dm9051_write_mem(dev, frag->data, frag->len);
+		//if ((MBNDRY_DEFAULT == MBNDRY_WORD) && !frag->frags && (frag->len & 1))
+		//	pad = 1;
+		dm9051_write_mem(dev, frag->data, frag->len); // + pad
+	}
+
+	/* MBNDRY_DEFAULT */
+	/* Pad to even length */
+	if (len & 1) {
+		uint8_t pad = 0x00;
+		dm9051_write_mem(dev, &pad, 1);
 	}
 
 	/* Trigger transmission */
@@ -462,6 +520,36 @@ static int eth_dm9051_tx(const struct device *dev, struct net_pkt *pkt)
 /*******************************************************************************
  * Packet Reception
  ******************************************************************************/
+
+/**
+ * @brief  Variable argument error handler with reset
+ *
+ * @param  format   Error format string
+ * @param  ...      Variable arguments
+ * @return          0 after reset completion
+ */
+uint16_t env_err_rsthdlr3(const char *format, ...)
+{
+  char bff[180];
+  int val;
+  va_list args;
+
+  va_start(args, format);
+  val = va_arg(args, int);
+  sprintf(bff, format, val);
+  printf("%s", bff);
+  va_end(args);
+
+  //dm9051_core_reset(dev); //cspi_core_reset();
+  //dm9051_set_receive(dev); //cspi_core_start1();
+  return 0;
+}
+
+void env_err_rst(const struct device *dev)
+{
+  dm9051_core_reset(dev); //cspi_core_reset();
+  dm9051_set_receive(dev); //cspi_core_start1();
+}
 
 /**
  * @brief Check if RX packet is ready
@@ -507,13 +595,24 @@ static int dm9051_rx_packet(const struct device *dev)
 	/* Validate packet */
 	if (rx_status & RSR_ERR_BITS) {
 		LOG_ERR("%s: RX error status=0x%02x", dev->name, rx_status);
+		env_err_rsthdlr3("_dm9051 rx_status error : 0x%02x\n",
+                                          rx_status);
+		env_err_rst(dev);
 		return -EIO;
 	}
 
 	if (rx_len > NET_ETH_MTU + sizeof(struct net_eth_hdr) + 4 || rx_len < 4) {
 		LOG_ERR("%s: RX length error len=%u", dev->name, rx_len);
+		env_err_rsthdlr3("_dm9051 rx_len error : %u\n",
+                                          rx_len);
+		env_err_rst(dev);
 		return -EINVAL;
 	}
+
+	/* rx_len default_boundary */
+	//if (MBNDRY_DEFAULT == MBNDRY_WORD)
+	//	rx_len = ((rx_len + 1) >> 1) << 1; 
+
 
 	/* rx_len from chip includes 4-byte CRC, but net_pkt is for frame data only */
 	uint16_t frame_len = rx_len - 4;
@@ -536,24 +635,58 @@ static int dm9051_rx_packet(const struct device *dev)
 			/* Discard the packet from DM9051's memory to prevent blocking */
 			uint8_t dummy[rx_len];
 			dm9051_read_mem(dev, dummy, rx_len);
+			/* MBNDRY_DEFAULT */
+			/* Pad to even length */
+			if (rx_len & 1) {
+				uint8_t pad;
+				dm9051_read_mem(dev, &pad, 1);
+			}
 			eth_stats_update_errors_rx(context->iface);
 			return -ENOMEM;
 		}
 	}
 
 	/* Read frame data into buffer fragments using the local implementation */
-	if (local_net_pkt_write_from(pkt, dm9051_read_mem_cb, (void *)dev, frame_len)) {
+	if (!pkt->buffer) {
+		LOG_WRN("%s: RX buffer allocation buffer NULL (size=%u, available pools: "
+			"RX_PKT=%d, RX_BUF=%d) - discarding packet",
+			dev->name, frame_len,
+			CONFIG_NET_PKT_RX_COUNT, CONFIG_NET_BUF_RX_COUNT);
+		/* Discard the packet from DM9051's memory to prevent blocking */
+		uint8_t dummy[rx_len];
+		dm9051_read_mem(dev, dummy, rx_len);
+		/* MBNDRY_DEFAULT */
+		/* Pad to even length */
+		if (rx_len & 1) {
+			uint8_t pad;
+			dm9051_read_mem(dev, &pad, 1);
+		}
+		eth_stats_update_errors_rx(context->iface);
+		return -ENOMEM;
+	}
+
+	if (local_net_pkt_read_from(pkt, dm9051_read_mem_cb, (void *)dev, frame_len)) {
 		LOG_ERR("%s: Failed to write packet into fragments", dev->name);
 		net_pkt_unref(pkt);
 		/* Attempt to discard the rest of the packet to prevent being stuck */
-		uint8_t dummy[rx_len];
-		dm9051_read_mem(dev, dummy, rx_len);
+		//uint8_t dummy[rx_len];
+		//dm9051_read_mem(dev, dummy, rx_len);
+		static uint16_t times = 0;
+		env_err_rsthdlr3("dm9 impossible pkt_read_from error times : %u\n", ++times);
+		env_err_rst(dev);
 		return -EIO;
 	}
 
 	/* Read and discard the 4-byte CRC to clear the RX buffer */
 	uint8_t crc_buf[4];
 	dm9051_read_mem(dev, crc_buf, 4);
+
+	/* MBNDRY_DEFAULT */
+	/* Pad to even length */
+	if (rx_len & 1) {
+		uint8_t pad;
+		dm9051_read_mem(dev, &pad, 1);
+	}
 
 	dm9051_write_reg(dev, DM9051_ISR, 0x80);
 
@@ -572,8 +705,6 @@ static int dm9051_rx_packet(const struct device *dev)
 /*******************************************************************************
  * RX Thread
  ******************************************************************************/
-
-extern int endc;
 
 static uint8_t dm9051_link_status(const struct device *dev)
 {
@@ -716,7 +847,8 @@ static int eth_dm9051_set_config(const struct device *dev, enum ethernet_config_
 {
 	struct dm9051_runtime *context = dev->data;
 
-	if (type == ETHERNET_CONFIG_TYPE_MAC_ADDRESS) {
+	switch (type) {
+	case ETHERNET_CONFIG_TYPE_MAC_ADDRESS:
 		memcpy(context->mac_address, config->mac_address.addr,
 		       sizeof(context->mac_address));
 
@@ -738,13 +870,102 @@ static int eth_dm9051_set_config(const struct device *dev, enum ethernet_config_
 					     sizeof(context->mac_address), NET_LINK_ETHERNET);
 		}
 
-		printk("%s: _dm9051_set_config: Interface configured.e [(set mac address, and set "
-		       "receive)]\n",
+		printk("%s: _dm9051_set_config: Interface configured [(set mac address)]\n",
 		       dev->name);
 		return 0;
+
+#ifdef CONFIG_NET_PROMISCUOUS_MODE
+	case ETHERNET_CONFIG_TYPE_PROMISC_MODE:
+		k_sem_take(&context->tx_rx_sem, K_FOREVER);
+
+		/* Read current RCR value */
+		uint8_t rcr_value;
+		rcr_value = dm9051_read_reg(dev, DM9051_RCR);
+
+		if (config->promisc_mode) {
+			/* Enable promiscuous mode */
+			rcr_value |= RCR_PRMSC;
+			LOG_INF("%s: Promiscuous mode enabled", dev->name);
+		} else {
+			/* Disable promiscuous mode */
+			rcr_value &= ~RCR_PRMSC;
+			LOG_INF("%s: Promiscuous mode disabled", dev->name);
+		}
+
+		/* Write updated RCR value */
+		dm9051_write_reg(dev, DM9051_RCR, rcr_value);
+
+		k_sem_give(&context->tx_rx_sem);
+		return 0;
+#endif
+
+#ifdef CONFIG_ETH_DM9051_MULTICAST_FILTER
+	case ETHERNET_CONFIG_TYPE_FILTER:
+		/* Configure MAC Address Register (MAR) for multicast filtering */
+		if (config->filter.type == ETHERNET_FILTER_TYPE_SET_MULTICAST) {
+			const struct ethernet_filter_multicast *filter = &config->filter.multicast;
+			uint32_t hash;
+			uint8_t mar[8] = {0};
+
+			k_sem_take(&context->tx_rx_sem, K_FOREVER);
+
+			/* Calculate hash for the multicast address */
+			hash = ((uint32_t)filter->mac_address.addr[0] << 24) |
+			       ((uint32_t)filter->mac_address.addr[1] << 16) |
+			       ((uint32_t)filter->mac_address.addr[2] << 8) |
+			       ((uint32_t)filter->mac_address.addr[3]);
+
+			/* Use CRC to determine hash table position */
+			uint8_t hash_bit = (hash >> 26) & 0x3f;
+			uint8_t mar_index = hash_bit / 8;
+			uint8_t bit_index = hash_bit % 8;
+
+			/* Read current MAR values */
+			for (int i = 0; i < 8; i++) {
+				mar[i] = dm9051_read_reg(dev, DM9051_MAR + i);
+			}
+
+			if (filter->enable) {
+				/* Set bit in hash table */
+				mar[mar_index] |= BIT(bit_index);
+				LOG_DBG("%s: Added multicast filter for "
+					"%02x:%02x:%02x:%02x:%02x:%02x",
+					dev->name, filter->mac_address.addr[0],
+					filter->mac_address.addr[1],
+					filter->mac_address.addr[2],
+					filter->mac_address.addr[3],
+					filter->mac_address.addr[4],
+					filter->mac_address.addr[5]);
+			} else {
+				/* Clear bit in hash table */
+				mar[mar_index] &= ~BIT(bit_index);
+				LOG_DBG("%s: Removed multicast filter for "
+					"%02x:%02x:%02x:%02x:%02x:%02x",
+					dev->name, filter->mac_address.addr[0],
+					filter->mac_address.addr[1],
+					filter->mac_address.addr[2],
+					filter->mac_address.addr[3],
+					filter->mac_address.addr[4],
+					filter->mac_address.addr[5]);
+			}
+
+			/* Write updated MAR values */
+			for (int i = 0; i < 8; i++) {
+				dm9051_write_reg(dev, DM9051_MAR + i, mar[i]);
+			}
+
+			k_sem_give(&context->tx_rx_sem);
+			return 0;
+		}
+
+		return -ENOTSUP;
+#endif
+
+	default:
+		break;
 	}
 
-	printk("%s: _dm9051_set_config: Interface configured.e [(nothing)]\n", dev->name);
+	LOG_DBG("%s: Unsupported configuration type %d", dev->name, type);
 	return -ENOTSUP;
 }
 
@@ -809,11 +1030,115 @@ void dm9051_init_log(const struct device *dev)
  * Device Initialization
  ******************************************************************************/
 
+/**
+ * @brief Perform hardware reset using reset GPIO
+ * @param dev Device structure
+ */
+static void dm9051_hw_reset(const struct device *dev)
+{
+	const struct dm9051_config *config = dev->config;
+
+	if (!config->reset.port) {
+		return;
+	}
+
+	/* Assert reset (active low) */
+	gpio_pin_set_dt(&config->reset, 1);
+	k_msleep(2);
+
+	/* Deassert reset */
+	gpio_pin_set_dt(&config->reset, 0);
+	k_msleep(10);
+
+	printk("_eth_dm9051_init: Hardware reset complete\n");
+}
+
+/**
+ * @brief Detect and verify DM9051 chip ID
+ * @param dev Device structure
+ * @return Chip ID on success, 0 on failure
+ */
+static uint16_t dm9051_detect_id(const struct device *dev)
+{
+	uint16_t chip_id;
+
+	/* Try reading chip ID multiple times */
+	for (int attempt = 0; attempt < 3; attempt++) {
+		k_msleep(50);
+		chip_id = dm9051_get_chipid(dev);
+		if (chip_id == 0x9051 || chip_id == 0x9058) {
+			break;
+		}
+	}
+
+	/* Verify chip ID before reset */
+	if (chip_id != 0x9051 && chip_id != 0x9058) {
+		printk("_eth_dm9051_init: ERROR: Invalid chip ID: 0x%04x (expected 0x9051 or "
+		       "0x9058)\n",
+		       chip_id);
+
+		while (1) {
+			chip_id = dm9051_get_chipid(dev);
+			if (chip_id == 0x9051 || chip_id == 0x9058) {
+				printk("\nINFO: DM9051 chip ID verified succeed: 0x%04x", chip_id);
+				break;
+			}
+			printk(" INFO: DM9051 chip ID verified failed: 0x%04x", chip_id);
+			printk(" (LOOP-TEST: delay)");
+			k_msleep(1000);
+		}
+		return 0;
+	}
+
+	return chip_id;
+}
+
+static int dm9051_init_mac(const struct device *dev)
+{
+	printk("\n(start.s=%d) MBNDRY_DEFAULT %s\n", endc, MBNDRY_DEFAULT == MBNDRY_WORD ? "MBNDRY_WORD" : "NA");
+		   
+	/* Detect and verify chip ID */
+	uint16_t chip_id = dm9051_detect_id(dev);
+	if (chip_id == 0)
+		return -ENODEV;
+
+	printk("(init_mac.s=%d) RX %s Chip ID: 0x%04x\n", endc++,
+	       cint(dev) ? "INTERRUPT mode" : "POLL mode",
+			chip_id);
+
+	/* Perform core reset */
+	dm9051_core_reset(dev);
+
+	struct dm9051_runtime *context = dev->data;
+	/* Priority 1: devicetree local-mac-address (already copied into context) */
+	if (dm9051_mac_is_valid(context->mac_address)) {
+	printk("dm9051_init_mac.e: Using DT MAC address %02x:%02x:%02x:%02x:%02x:%02x\n",
+			context->mac_address[0], context->mac_address[1], context->mac_address[2],
+			context->mac_address[3], context->mac_address[4], context->mac_address[5]);
+	return 0;
+	}
+
+	/* Priority 2: try NVS */
+	if (dm9051_load_mac_from_current_fit(dev, context->mac_address) == 0 &&
+		dm9051_mac_is_valid(context->mac_address)) {
+	printk("dm9051_init_mac.e: Using CHIP MAC address %02x:%02x:%02x:%02x:%02x:%02x\n",
+			context->mac_address[0], context->mac_address[1], context->mac_address[2],
+			context->mac_address[3], context->mac_address[4], context->mac_address[5]);
+	return 0;
+	}
+
+	/* Priority 3: fallback random locally administered unicast */
+	dm9051_generate_random_mac(context->mac_address);
+	printk("dm9051_init_mac.e: Using random MAC address %02x:%02x:%02x:%02x:%02x:%02x\n",
+			context->mac_address[0], context->mac_address[1], context->mac_address[2],
+			context->mac_address[3], context->mac_address[4], context->mac_address[5]);
+	return 0;
+}
+
 static int eth_dm9051_init(const struct device *dev)
 {
 	const struct dm9051_config *config = dev->config;
 	struct dm9051_runtime *context = dev->data;
-	uint16_t chip_id;
 
 	/* Check SPI is ready */
 	if (!spi_is_ready_dt(&config->spi)) {
@@ -830,6 +1155,22 @@ static int eth_dm9051_init(const struct device *dev)
 	/* CS GPIO is automatically configured and controlled by SPI driver layer.
 	 * No manual GPIO configuration needed when cs-gpios is set in device tree.
 	 */
+
+	/* Configure reset GPIO if reset-gpios is defined in device tree */
+	if (config->reset.port) {
+		if (!gpio_is_ready_dt(&config->reset)) {
+			LOG_ERR("Reset GPIO port %s not ready", config->reset.port->name);
+			return -EINVAL;
+		}
+
+		if (gpio_pin_configure_dt(&config->reset, GPIO_OUTPUT_INACTIVE)) {
+			LOG_ERR("Unable to configure reset GPIO pin %u", config->reset.pin);
+			return -EINVAL;
+		}
+
+		printk("_eth_dm9051_init: Reset GPIO configured - Port: %s, Pin: %d\n",
+		       config->reset.port->name, config->reset.pin);
+	}
 
 	/* Configure interrupt GPIO if int-gpios is defined in device tree */
 	if (cint(dev)) {
@@ -859,36 +1200,12 @@ static int eth_dm9051_init(const struct device *dev)
 		printk("_eth_dm9051_init: Configuring POLLING mode (no int-gpios defined)\n");
 	}
 
-	/* Try reading chip ID multiple times */
-	for (int attempt = 0; attempt < 3; attempt++) {
-		k_msleep(50);
-		chip_id = dm9051_get_chipid(dev);
-		if (chip_id == 0x9051 || chip_id == 0x9058) {
-			break;
-		}
-	}
+	/* Perform hardware reset */
+	dm9051_hw_reset(dev);
 
-	/* Verify chip ID before reset */
-	if (chip_id != 0x9051 && chip_id != 0x9058) {
-		printk("_eth_dm9051_init: ERROR: Invalid chip ID: 0x%04x (expected 0x9051 or "
-		       "0x9058)\n",
-		       chip_id);
-
-		while (1) {
-			chip_id = dm9051_get_chipid(dev);
-			if (chip_id == 0x9051 || chip_id == 0x9058) {
-				printk("\nINFO: DM9051 chip ID verified succeed: 0x%04x", chip_id);
-				break;
-			}
-			printk(" INFO: DM9051 chip ID verified failed: 0x%04x", chip_id);
-			printk(" (LOOP-TEST: delay)");
-			k_msleep(1000);
-		}
+	/* Decide MAC address: DT local-mac-address > NVS > random */
+	if (dm9051_init_mac(dev) != 0)
 		return -ENODEV;
-	}
-
-	/* Perform core reset */
-	dm9051_core_reset(dev);
 
 	/* Set MAC address */
 	dm9051_set_mac_address(dev, context->mac_address); // to be checked! more!
@@ -899,12 +1216,10 @@ static int eth_dm9051_init(const struct device *dev)
 	/* Set carrier on after successful initialization */
 	context->iface_carrier_on_init = true;
 
-	printk("\n(end.e=%d) %s Configuring %s\n", endc++,
-	       STRINGIFY(BUILD_VERSION), cint(dev) ? "INTERRUPT mode" : "POLL mode");
-	printk("dm9051_init.e: (set mac address, %02x:%02x:%02x:%02x:%02x:%02x) Chip ID: "
-	       "0x%04x\n",
-	       context->mac_address[0], context->mac_address[1], context->mac_address[2],
-	       context->mac_address[3], context->mac_address[4], context->mac_address[5], chip_id);
+	//printk("dm9051_init.e: (set mac address, %02x:%02x:%02x:%02x:%02x:%02x) Chip ID: "
+	//       "0x%04x\n",
+	//       context->mac_address[0], context->mac_address[1], context->mac_address[2],
+	//       context->mac_address[3], context->mac_address[4], context->mac_address[5], chip_id);
 	return 0;
 }
 
@@ -923,6 +1238,7 @@ static int eth_dm9051_init(const struct device *dev)
 	static const struct dm9051_config dm9051_config_##inst = {                                 \
 		.spi = SPI_DT_SPEC_INST_GET(inst, SPI_WORD_SET(8), 0),                             \
 		.interrupt = GPIO_DT_SPEC_INST_GET(inst, int_gpios),                               \
+		.reset = GPIO_DT_SPEC_INST_GET(inst, reset_gpios),                                 \
 		.timeout = 500,                                                                    \
 	};                                                                                         \
                                                                                                    \
